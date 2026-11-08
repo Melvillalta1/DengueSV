@@ -6,19 +6,25 @@ Aplicación Streamlit con dos secciones:
   1. Predictor interactivo: el usuario ajusta condiciones y ve la predicción
   2. Tablero histórico: predicciones del modelo vs casos reales
 
-Uso:
-    1. Ejecutar primero:  python entrenar_modelo.py   (genera modelo_dengue.pkl)
-    2. Luego lanzar:       streamlit run app.py
+Despliegue en la nube (Streamlit Community Cloud):
+  No es necesario subir 'modelo_dengue.pkl'. Si el archivo no existe,
+  la app entrena el modelo automáticamente al arrancar con los datos
+  publicados en el repositorio (Opción A).
+
+Uso local:
+    streamlit run app.py
 
 Requisitos:
     pip install streamlit pandas numpy xgboost scikit-learn joblib matplotlib
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DE LA PÁGINA
@@ -33,14 +39,70 @@ st.set_page_config(
 URL_DATOS = "https://raw.githubusercontent.com/Melvillalta1/DengueSV/refs/heads/main/dataset_pais_semana.csv"
 ARCHIVO_MODELO = "modelo_dengue.pkl"
 
+# Hiperparámetros óptimos (hallados con GridSearchCV en la etapa de optimización)
+HIPERPARAMS = {
+    "learning_rate": 0.03,
+    "max_depth": 3,
+    "n_estimators": 200,
+    "subsample": 0.8,
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CARGA DE MODELO Y DATOS (con caché para eficiencia)
+# CARGA / ENTRENAMIENTO DEL MODELO (con caché para eficiencia)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def cargar_modelo():
-    return joblib.load(ARCHIVO_MODELO)
+    """Carga el modelo desde disco; si no existe, lo entrena al vuelo.
+
+    Esto permite el despliegue en la nube sin necesidad de subir el .pkl:
+    la primera vez entrena con los datos del repositorio (tarda unos segundos)
+    y guarda el resultado en caché para las siguientes cargas.
+    """
+    # 1) Si el modelo ya está en disco, usarlo tal cual
+    if os.path.exists(ARCHIVO_MODELO):
+        return joblib.load(ARCHIVO_MODELO)
+
+    # 2) Si no existe, entrenarlo con los datos publicados en el repo
+    df = pd.read_csv(URL_DATOS)
+    df = df.sort_values(["anio_epi", "semana_epi"]).reset_index(drop=True)
+
+    OBJETIVO = "casos_dengue"
+    excluir = ["casos_dengue", "anio_epi", "calendar_start_date",
+               "calendar_end_date", "indice_temporal"]
+    predictoras = [c for c in df.columns if c not in excluir]
+
+    # Entrenar con datos hasta 2021 (2022-2024 quedan como referencia histórica)
+    train = df[df["anio_epi"] <= 2021].copy()
+    X = train[predictoras].copy()
+    y = train[OBJETIVO].copy()
+    mask = X.notna().all(axis=1)
+    X, y = X[mask], y[mask]
+
+    modelo = XGBRegressor(**HIPERPARAMS)
+    modelo.fit(X, np.log1p(y))  # objetivo transformado con log
+
+    paquete = {
+        "modelo": modelo,
+        "predictoras": predictoras,
+        "objetivo": OBJETIVO,
+        "hiperparametros": HIPERPARAMS,
+        "valores_mediana": df[predictoras].median().to_dict(),
+        "valores_min": df[predictoras].min().to_dict(),
+        "valores_max": df[predictoras].max().to_dict(),
+    }
+
+    # Intentar guardar en disco para acelerar próximas cargas (no es crítico)
+    try:
+        joblib.dump(paquete, ARCHIVO_MODELO)
+    except Exception:
+        pass
+
+    return paquete
+
 
 @st.cache_data
 def cargar_datos():
@@ -50,7 +112,8 @@ def cargar_datos():
 
 
 try:
-    paquete = cargar_modelo()
+    with st.spinner("Preparando el modelo (la primera vez puede tardar unos segundos)..."):
+        paquete = cargar_modelo()
     modelo = paquete["modelo"]
     predictoras = paquete["predictoras"]
     medianas = paquete["valores_mediana"]
@@ -58,8 +121,9 @@ try:
     maximos = paquete["valores_max"]
     df = cargar_datos()
     modelo_ok = True
-except FileNotFoundError:
+except Exception as e:
     modelo_ok = False
+    error_msg = str(e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,8 +139,8 @@ st.markdown(
 
 if not modelo_ok:
     st.error(
-        "No se encontró el archivo 'modelo_dengue.pkl'. "
-        "Ejecuta primero `python entrenar_modelo.py` para generar el modelo."
+        "No se pudo preparar el modelo automáticamente. "
+        f"Detalle técnico: {error_msg}"
     )
     st.stop()
 
